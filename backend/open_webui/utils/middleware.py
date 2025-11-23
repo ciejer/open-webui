@@ -2742,7 +2742,10 @@ async def process_chat_response(
                                 )
 
                     if response_tool_calls:
-                        tool_calls.append((response_tool_calls, response_reasoning_details))
+                        tool_calls.append({
+                            'tool_calls': response_tool_calls,
+                            'reasoning_details': response_reasoning_details
+                        })
 
                     if response.background:
                         await response.background()
@@ -2758,15 +2761,18 @@ async def process_chat_response(
 
                     tool_call_retries += 1
 
-                    response_tool_calls, response_reasoning_details = tool_calls.pop(0)
+                    tool_call_data = tool_calls.pop(0)
+                    response_tool_calls = tool_call_data['tool_calls']
+                    response_reasoning_details = tool_call_data['reasoning_details']
 
-                    content_blocks.append(
-                        {
-                            "type": "tool_calls",
-                            "content": response_tool_calls,
-                            **({"reasoning_details": response_reasoning_details} if response_reasoning_details else {}),
-                        }
-                    )
+                    content_block = {
+                        "type": "tool_calls",
+                        "content": response_tool_calls,
+                    }
+                    if response_reasoning_details:
+                        content_block["reasoning_details"] = response_reasoning_details
+                    
+                    content_blocks.append(content_block)
 
                     await event_emitter(
                         {
