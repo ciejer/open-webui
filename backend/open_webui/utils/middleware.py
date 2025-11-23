@@ -2111,13 +2111,15 @@ async def process_chat_response(
                 temp_blocks = []
                 for idx, block in enumerate(content_blocks):
                     if block["type"] == "tool_calls":
-                        messages.append(
-                            {
-                                "role": "assistant",
-                                "content": serialize_content_blocks(temp_blocks, raw),
-                                "tool_calls": block.get("content"),
-                            }
-                        )
+                        assistant_message = {
+                            "role": "assistant",
+                            "content": serialize_content_blocks(temp_blocks, raw),
+                            "tool_calls": block.get("content"),
+                        }
+                        # Include reasoning_details if present (for OpenRouter reasoning models)
+                        if block.get("reasoning_details"):
+                            assistant_message["reasoning_details"] = block.get("reasoning_details")
+                        messages.append(assistant_message)
 
                         results = block.get("results", [])
 
@@ -2390,6 +2392,7 @@ async def process_chat_response(
                     nonlocal content_blocks
 
                     response_tool_calls = []
+                    response_reasoning_details = None
 
                     delta_count = 0
                     delta_chunk_size = max(
@@ -2555,6 +2558,19 @@ async def process_chat_response(
                                                         ][
                                                             "arguments"
                                                         ] += delta_arguments
+
+                                    # Capture reasoning_details from delta for OpenRouter reasoning models
+                                    delta_reasoning_details = delta.get("reasoning_details")
+                                    if delta_reasoning_details:
+                                        if response_reasoning_details is None:
+                                            response_reasoning_details = delta_reasoning_details
+                                        else:
+                                            # Merge reasoning_details if it comes in multiple chunks
+                                            # (though typically it comes as a single object)
+                                            response_reasoning_details = {
+                                                **response_reasoning_details,
+                                                **delta_reasoning_details
+                                            }
 
                                     value = delta.get("content")
 
@@ -2726,7 +2742,7 @@ async def process_chat_response(
                                 )
 
                     if response_tool_calls:
-                        tool_calls.append(response_tool_calls)
+                        tool_calls.append((response_tool_calls, response_reasoning_details))
 
                     if response.background:
                         await response.background()
@@ -2742,12 +2758,13 @@ async def process_chat_response(
 
                     tool_call_retries += 1
 
-                    response_tool_calls = tool_calls.pop(0)
+                    response_tool_calls, response_reasoning_details = tool_calls.pop(0)
 
                     content_blocks.append(
                         {
                             "type": "tool_calls",
                             "content": response_tool_calls,
+                            **({"reasoning_details": response_reasoning_details} if response_reasoning_details else {}),
                         }
                     )
 
