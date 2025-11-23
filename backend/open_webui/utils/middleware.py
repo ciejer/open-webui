@@ -2744,8 +2744,8 @@ async def process_chat_response(
 
                     if response_tool_calls:
                         tool_calls.append({
-                            'tool_calls': response_tool_calls,
-                            'reasoning_details': response_reasoning_details
+                            "tool_calls": response_tool_calls,
+                            "reasoning_details": response_reasoning_details
                         })
 
                     if response.background:
