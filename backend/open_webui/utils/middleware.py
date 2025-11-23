@@ -2117,8 +2117,9 @@ async def process_chat_response(
                             "tool_calls": block.get("content"),
                         }
                         # Include reasoning_details if present (for OpenRouter reasoning models)
-                        if block.get("reasoning_details"):
-                            assistant_message["reasoning_details"] = block.get("reasoning_details")
+                        reasoning_details = block.get("reasoning_details")
+                        if reasoning_details:
+                            assistant_message["reasoning_details"] = reasoning_details
                         messages.append(assistant_message)
 
                         results = block.get("results", [])
@@ -2765,14 +2766,17 @@ async def process_chat_response(
                     response_tool_calls = tool_call_data['tool_calls']
                     response_reasoning_details = tool_call_data['reasoning_details']
 
-                    content_block = {
-                        "type": "tool_calls",
-                        "content": response_tool_calls,
-                    }
-                    if response_reasoning_details:
-                        content_block["reasoning_details"] = response_reasoning_details
-                    
-                    content_blocks.append(content_block)
+                    content_blocks.append(
+                        {
+                            "type": "tool_calls",
+                            "content": response_tool_calls,
+                            **(
+                                {"reasoning_details": response_reasoning_details}
+                                if response_reasoning_details
+                                else {}
+                            ),
+                        }
+                    )
 
                     await event_emitter(
                         {
