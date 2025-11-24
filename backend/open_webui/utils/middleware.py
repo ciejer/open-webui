@@ -1879,6 +1879,17 @@ async def process_chat_response(
                         )
 
                     choices = response_data.get("choices", [])
+                    if choices:
+                        message = choices[0].get("message", {})
+                        if "reasoning_details" in message:
+                            Chats.upsert_message_to_chat_by_id_and_message_id(
+                                metadata["chat_id"],
+                                metadata["message_id"],
+                                {
+                                    "reasoningDetails": message["reasoning_details"],
+                                },
+                            )
+
                     if choices and choices[0].get("message", {}).get("content"):
                         content = response_data["choices"][0]["message"]["content"]
 
@@ -2028,6 +2039,8 @@ async def process_chat_response(
 
         # Handle as a background task
         async def response_handler(response, events):
+            reasoning_details = []
+
             def serialize_content_blocks(content_blocks, raw=False):
                 content = ""
 
@@ -2446,6 +2459,7 @@ async def process_chat_response(
                 async def stream_body_handler(response, form_data):
                     nonlocal content
                     nonlocal content_blocks
+                    nonlocal reasoning_details
 
                     response_tool_calls = []
 
@@ -2554,6 +2568,9 @@ async def process_chat_response(
                                         continue
 
                                     delta = choices[0].get("delta", {})
+                                    if "reasoning_details" in delta and delta["reasoning_details"]:
+                                        reasoning_details.extend(delta["reasoning_details"])
+
                                     delta_tool_calls = delta.get("tool_calls", None)
 
                                     if delta_tool_calls:
@@ -2750,6 +2767,11 @@ async def process_chat_response(
                                                 {
                                                     "content": serialize_content_blocks(
                                                         content_blocks
+                                                    ),
+                                                    "reasoningDetails": (
+                                                        reasoning_details
+                                                        if reasoning_details
+                                                        else None
                                                     ),
                                                 },
                                             )
@@ -2986,16 +3008,23 @@ async def process_chat_response(
                     )
 
                     try:
+                        new_messages = [
+                            *form_data["messages"],
+                            *convert_content_blocks_to_messages(content_blocks, True),
+                        ]
+
+                        if (
+                            reasoning_details
+                            and new_messages
+                            and new_messages[-1]["role"] == "assistant"
+                        ):
+                            new_messages[-1]["reasoning_details"] = reasoning_details
+
                         new_form_data = {
                             **form_data,
                             "model": model_id,
                             "stream": True,
-                            "messages": [
-                                *form_data["messages"],
-                                *convert_content_blocks_to_messages(
-                                    content_blocks, True
-                                ),
-                            ],
+                            "messages": new_messages,
                         }
 
                         res = await generate_chat_completion(
@@ -3205,6 +3234,9 @@ async def process_chat_response(
                         metadata["message_id"],
                         {
                             "content": serialize_content_blocks(content_blocks),
+                            "reasoningDetails": (
+                                reasoning_details if reasoning_details else None
+                            ),
                         },
                     )
 
@@ -3243,6 +3275,9 @@ async def process_chat_response(
                         metadata["message_id"],
                         {
                             "content": serialize_content_blocks(content_blocks),
+                            "reasoningDetails": (
+                                reasoning_details if reasoning_details else None
+                            ),
                         },
                     )
 
