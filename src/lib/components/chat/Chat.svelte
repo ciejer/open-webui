@@ -1246,7 +1246,7 @@
 					models: selectedModels,
 					messages: messages,
 					history: history,
-					params: params,
+				 params: params,
 					files: chatFiles
 				});
 
@@ -1401,6 +1401,23 @@
 		}
 
 		if (choices) {
+			const choice = choices[0];
+			const delta = choice?.delta;
+			const msg = choice?.message;
+
+			const reasoningContent =
+				delta?.reasoning_content ||
+				delta?.reasoning_details ||
+				msg?.reasoning_content ||
+				msg?.reasoning_details;
+
+			if (reasoningContent) {
+				if (!message.reasoningDetails) {
+					message.reasoningDetails = '';
+				}
+				message.reasoningDetails += reasoningContent;
+			}
+
 			if (choices[0]?.message?.content) {
 				// Non-stream response
 				message.content += choices[0]?.message?.content;
@@ -1902,7 +1919,10 @@
 						}
 					: {
 							content: message?.merged?.content ?? message.content
-						})
+						}),
+				...(message.reasoningDetails
+					? { reasoning_content: message.reasoningDetails }
+					: {})
 			}))
 			.filter((message) => message?.role === 'user' || message?.content?.trim());
 

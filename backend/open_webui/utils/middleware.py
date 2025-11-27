@@ -142,6 +142,65 @@ DEFAULT_SOLUTION_TAGS = [("<|begin_of_solution|>", "<|end_of_solution|>")]
 DEFAULT_CODE_INTERPRETER_TAGS = [("<code_interpreter>", "</code_interpreter>")]
 
 
+def extract_reasoning_details_from_completion(completion: dict | None) -> list | None:
+    """
+    Extract reasoning_details (if any) from a non-streaming chat.completions response.
+
+    We assume an OpenAI/OpenRouter-compatible shape:
+        completion["choices"][0]["message"]["reasoning_details"]
+    """
+    if not isinstance(completion, dict):
+        return None
+
+    try:
+        message = completion["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+    reasoning_details = message.get("reasoning_details")
+    if reasoning_details:
+        # Do NOT mutate – pass-through exactly as returned
+        return reasoning_details
+
+    return None
+
+
+def attach_reasoning_details_to_messages(
+    messages: list[dict],
+    reasoning_details: list | None,
+) -> list[dict]:
+    """
+    Attach reasoning_details to the last assistant message in `messages`.
+    Prefer the last assistant message that has tool_calls, falling back to the
+    last assistant message if needed.
+
+    This is used only for follow-up tool calls to reasoning models.
+    """
+    if not reasoning_details or not messages:
+        return messages
+
+    target_msg = None
+
+    # Prefer assistant with tool_calls
+    for msg in reversed(messages):
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            target_msg = msg
+            break
+
+    # Fallback: last assistant
+    if target_msg is None:
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant":
+                target_msg = msg
+                break
+
+    if target_msg is not None:
+        # Overwrite to be safe, but normally it's missing entirely
+        target_msg["reasoning_details"] = reasoning_details
+
+    return messages
+
+
 def process_tool_result(
     request,
     tool_function_name,
@@ -360,9 +419,22 @@ async def chat_completion_tools_handler(
         body["messages"], task_model_id, tools_function_calling_prompt
     )
 
+    backend_hidden = None
+
     try:
         response = await generate_chat_completion(request, form_data=payload, user=user)
         log.debug(f"{response=}")
+
+        # Extract reasoning_details if available (non-streaming responses only)
+        if isinstance(response, dict):
+            reasoning_details = extract_reasoning_details_from_completion(response)
+            if reasoning_details:
+                backend_hidden = {
+                    "openai_like": {
+                        "reasoning_details": reasoning_details,
+                    }
+                }
+
         content = await get_content_from_response(response)
         log.debug(f"{content=}")
 
@@ -524,7 +596,10 @@ async def chat_completion_tools_handler(
     if skip_files and "files" in body.get("metadata", {}):
         del body["metadata"]["files"]
 
-    return body, {"sources": sources}
+    # backend_hidden is an opaque vendor-agnostic container for backend state
+    # (e.g. reasoning_details) that callers may choose to re-attach on
+    # subsequent internal model calls. It is never sent to the frontend.
+    return body, {"sources": sources, "backend_hidden": backend_hidden}
 
 
 async def chat_memory_handler(
@@ -1501,12 +1576,26 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 for tool in tools_dict.values()
             ]
         else:
-            # If the function calling is not native, then call the tools function calling handler
+            # If the function calling is not native, then call the tools
+            # function-calling handler once, and optionally re-attach any
+            # backend-hidden reasoning_details to the updated messages. This
+            # keeps vendor-specific state internal to the backend and never
+            # exposes it to the frontend.
             try:
                 form_data, flags = await chat_completion_tools_handler(
                     request, form_data, extra_params, user, models, tools_dict
                 )
                 sources.extend(flags.get("sources", []))
+
+                backend_hidden = flags.get("backend_hidden")
+                if backend_hidden:
+                    openai_like = backend_hidden.get("openai_like")
+                    if isinstance(openai_like, dict):
+                        reasoning_details = openai_like.get("reasoning_details")
+                        if reasoning_details:
+                            form_data["messages"] = attach_reasoning_details_to_messages(
+                                form_data["messages"], reasoning_details
+                            )
             except Exception as e:
                 log.exception(e)
 
@@ -1879,6 +1968,17 @@ async def process_chat_response(
                         )
 
                     choices = response_data.get("choices", [])
+                    if choices:
+                        message = choices[0].get("message", {})
+                        if "reasoning_details" in message:
+                            Chats.upsert_message_to_chat_by_id_and_message_id(
+                                metadata["chat_id"],
+                                metadata["message_id"],
+                                {
+                                    "reasoningDetails": message["reasoning_details"],
+                                },
+                            )
+
                     if choices and choices[0].get("message", {}).get("content"):
                         content = response_data["choices"][0]["message"]["content"]
 
@@ -2028,6 +2128,8 @@ async def process_chat_response(
 
         # Handle as a background task
         async def response_handler(response, events):
+            reasoning_details = []
+
             def serialize_content_blocks(content_blocks, raw=False):
                 content = ""
 
@@ -2446,6 +2548,7 @@ async def process_chat_response(
                 async def stream_body_handler(response, form_data):
                     nonlocal content
                     nonlocal content_blocks
+                    nonlocal reasoning_details
 
                     response_tool_calls = []
 
@@ -2554,6 +2657,9 @@ async def process_chat_response(
                                         continue
 
                                     delta = choices[0].get("delta", {})
+                                    if "reasoning_details" in delta and delta["reasoning_details"]:
+                                        reasoning_details.extend(delta["reasoning_details"])
+
                                     delta_tool_calls = delta.get("tool_calls", None)
 
                                     if delta_tool_calls:
@@ -2666,6 +2772,7 @@ async def process_chat_response(
                                             "content": serialize_content_blocks(
                                                 content_blocks
                                             )
+
                                         }
 
                                     if value:
@@ -2750,6 +2857,11 @@ async def process_chat_response(
                                                 {
                                                     "content": serialize_content_blocks(
                                                         content_blocks
+                                                    ),
+                                                    "reasoningDetails": (
+                                                        reasoning_details
+                                                        if reasoning_details
+                                                        else None
                                                     ),
                                                 },
                                             )
@@ -2986,16 +3098,23 @@ async def process_chat_response(
                     )
 
                     try:
+                        new_messages = [
+                            *form_data["messages"],
+                            *convert_content_blocks_to_messages(content_blocks, True),
+                        ]
+
+                        if (
+                            reasoning_details
+                            and new_messages
+                            and new_messages[-1]["role"] == "assistant"
+                        ):
+                            new_messages[-1]["reasoning_details"] = reasoning_details
+
                         new_form_data = {
                             **form_data,
                             "model": model_id,
                             "stream": True,
-                            "messages": [
-                                *form_data["messages"],
-                                *convert_content_blocks_to_messages(
-                                    content_blocks, True
-                                ),
-                            ],
+                            "messages": new_messages,
                         }
 
                         res = await generate_chat_completion(
@@ -3205,6 +3324,9 @@ async def process_chat_response(
                         metadata["message_id"],
                         {
                             "content": serialize_content_blocks(content_blocks),
+                            "reasoningDetails": (
+                                reasoning_details if reasoning_details else None
+                            ),
                         },
                     )
 
@@ -3243,6 +3365,9 @@ async def process_chat_response(
                         metadata["message_id"],
                         {
                             "content": serialize_content_blocks(content_blocks),
+                            "reasoningDetails": (
+                                reasoning_details if reasoning_details else None
+                            ),
                         },
                     )
 
